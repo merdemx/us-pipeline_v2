@@ -1,0 +1,23 @@
+# İndirilen ham veri ve büyük feature dosyaları — yeniden üretilebilir
+cache/
+output/*.parquet
+
+# Eğitilmiş modeller repoda tutulur (retrain sonrası elle commit edilir)
+# model/saved/*.pkl  ← commit edilir
+
+# Versiyon geçmişi repoda tutulur
+# model/saved/versions/  ← commit edilir
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,68 @@
+[
+  {
+    "retrained_at": "2026-05-05 08:33",
+    "version_tag": "20260505",
+    "accepted": true,
+    "reason": "ilk eğitim",
+    "holdout_ic": 0.1613596048389791,
+    "top1_precision": 0.0,
+    "live_precision": null,
+    "oot_ensemble_ic": 0.1613596048389791,
+    "cv_ics": {
+      "xgb": 0.017118173739937466,
+      "lgb": 0.016260581364116816,
+      "cat": 0.017620645709005973
+    },
+    "oot_ics": {
+      "xgb": 0.010551948051948052,
+      "lgb": 0.01406926406926407,
+      "cat": 0.017586580086580084,
+      "ensemble": 0.1613596048389791
+    },
+    "best_params": {
+      "xgb": {
+        "n_estimators": 313,
+        "max_depth": 6,
+        "learning_rate": 0.008032138504581631,
+        "subsample": 0.5116239718424028,
+        "colsample_bytree": 0.8153190262527628,
+        "min_child_weight": 14,
+        "reg_alpha": 0.014017418780063925,
+        "reg_lambda": 0.0017090404997054446,
+        "scale_pos_weight": 4.370498671360202
+      },
+      "lgb": {
+        "n_estimators": 531,
+        "num_leaves": 141,
+        "learning_rate": 0.009136795538736246,
+        "subsample": 0.5716151777749746,
+        "colsample_bytree": 0.4013207258612619,
+        "min_child_samples": 48,
+        "reg_alpha": 8.679591476909811,
+        "reg_lambda": 5.426825411286962,
+        "cw_pos": 5.530200256931047
+      },
+      "cat": {
+        "iterations": 702,
+        "depth": 3,
+        "learning_rate": 0.00513560740960667,
+        "l2_leaf_reg": 0.9432650816389782,
+        "subsample": 0.5879926368350565,
+        "colsample_bylevel": 0.5934358664480394,
+        "cw_pos": 0.6980937830276003
+      }
+    },
+    "feature_importance_top10": [
+      "hvol_126d",
+      "atr_norm",
+      "macro_tnx",
+      "hvol_63d",
+      "price_target_upside",
+      "vix_regime",
+      "macro_wti",
+      "sp500_ret_3m",
+      "quarter",
+      "sp500_ret_1m"
+    ]
+  }
+]

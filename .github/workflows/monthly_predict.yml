@@ -1,0 +1,233 @@
+name: Aylık Tahmin
+
+on:
+  # Önceki ayın kapanışından sonra — ayın 1'i 06:00 UTC (TR 09:00)
+  # US piyasaları önceki gece ~21:00 UTC'de kapanır, veri saatlerdir hazır olur
+  schedule:
+    - cron: "0 6 1 * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210  # pipeline ~90dk + predict ~30dk + pay
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Bağımlılıklar
+        run: pip install -r requirements.txt
+
+      - name: Ay anahtarı
+        id: date
+        run: echo "month=$(date +%Y-%m)" >> $GITHUB_OUTPUT
+
+      - name: Cache — fiyat verisi
+        uses: actions/cache@v4
+        with:
+          path: cache/raw
+          key: yf-raw-${{ runner.os }}-${{ steps.date.outputs.month }}
+          restore-keys: yf-raw-${{ runner.os }}-
+
+      - name: Cache — fundamental veri
+        uses: actions/cache@v4
+        with:
+          path: cache/fundamentals
+          key: yf-fund-${{ runner.os }}-${{ steps.date.outputs.month }}
+          restore-keys: yf-fund-${{ runner.os }}-
+
+      - name: Pipeline (veri güncelle)
+        run: python pipeline.py --ticker_file us_tickers.xlsx
+        env:
+          PYTHONIOENCODING: utf-8
+
+      - name: Tahmin üret
+        run: python model/predict_monthly.py --skip-pipeline
+        env:
+          PYTHONIOENCODING: utf-8
+
+      - name: Commit & push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f output/tahmin_*.xlsx || true
+          if git diff --cached --quiet; then
+            echo "Değişiklik yok."
+          else
+            git commit -m "predict: ${{ steps.date.outputs.month }} aylık tahmin [skip ci]"
+            git pull --rebase origin main
+            git push
+          fi
+
+      - name: Tahmin özetini hazırla
+        id: summary
+        run: |
+          python - <<'EOF'
+          import os, glob, pandas as pd
+
+          lines = []
+
+          pred_files = sorted(glob.glob("output/tahmin_[0-9]*.xlsx"))
+          if pred_files:
+              try:
+                  df = pd.read_excel(pred_files[-1], sheet_name="Birlesik")
+                  lines.append("=== Birlesik Top-5 (A_1m_Cap1) ===")
+                  for _, row in df.head(5).iterrows():
+                      ticker = str(row.get("ticker", "")).strip()
+                      skor   = row.get("prob_bir", 0)
+                      sira   = int(row.get("sira", _ + 1))
+                      lines.append(f"  {sira}. {ticker:<8} skor={float(skor):.4f}")
+              except Exception as e:
+                  lines.append(f"Birlesik okunamadi: {e}")
+
+              try:
+                  df2 = pd.read_excel(pred_files[-1], sheet_name="Karma_Top5")
+                  lines.append("\n=== Karma Top-5 (4 Mom + 1 Rev) ===")
+                  for _, row in df2.iterrows():
+                      ticker = str(row.get("ticker", "")).strip()
+                      skor   = row.get("skor", 0)
+                      kaynak = str(row.get("kaynak", ""))
+                      if ticker:
+                          lines.append(f"  {_+1}. {ticker:<8} {kaynak:<10} skor={float(skor):.4f}")
+              except Exception:
+                  pass
+
+          if not lines:
+              lines.append("Tahmin dosyasi bulunamadi.")
+
+          body = "\n".join(lines)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"top5<<EOF\n{body}\nEOF\n")
+          EOF
+
+      - name: Canli performans kontrolu (erken retrain tetikleyici)
+        id: perf
+        run: |
+          python - <<'EOF'
+          import json, glob, os, sys
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+
+          LIVE_MONTHS   = 3
+          TRIGGER_RATIO = 0.65
+
+          def write_output(trigger):
+              out = os.environ.get("GITHUB_OUTPUT", "")
+              if out:
+                  with open(out, "a") as fh:
+                      fh.write(f"trigger={trigger}\n")
+
+          hist_path = Path("model/saved/retrain_history.json")
+          if not hist_path.exists():
+              write_output("false"); sys.exit(0)
+          with open(hist_path) as f:
+              hist = json.load(f)
+          last_ok   = next((e for e in reversed(hist) if e.get("accepted")), None)
+          ref_top1  = (last_ok or {}).get("top1_precision")
+          if not ref_top1:
+              write_output("false"); sys.exit(0)
+
+          pq_files = sorted(glob.glob("output/features_monthly*.parquet"))
+          if not pq_files:
+              write_output("false"); sys.exit(0)
+          df = pd.read_parquet(pq_files[-1])
+          df["month_end"] = pd.to_datetime(df["month_end"])
+          if "LABEL_RANK_TOP20" not in df.columns:
+              write_output("false"); sys.exit(0)
+
+          pred_files = sorted(glob.glob("output/tahmin_[0-9]*.xlsx"))[-LIVE_MONTHS:]
+          scores = []
+          for pf in pred_files:
+              stem = Path(pf).stem
+              try:
+                  yyyymm = stem.split("_")[1][:6]
+                  year, month = int(yyyymm[:4]), int(yyyymm[4:6])
+              except Exception:
+                  continue
+              f_year  = year if month > 1 else year - 1
+              f_month = month - 1 if month > 1 else 12
+              mdata = df[
+                  (df["month_end"].dt.year  == f_year) &
+                  (df["month_end"].dt.month == f_month) &
+                  df["LABEL_RANK_TOP20"].notna()
+              ].copy()
+              if len(mdata) < 20:
+                  continue
+              try:
+                  dp      = pd.read_excel(pf, sheet_name="Birlesik")
+                  tickers = dp["ticker"].dropna().head(5).tolist()
+              except Exception:
+                  continue
+              if not tickers:
+                  continue
+              matched  = mdata[mdata["ticker"].isin(tickers)]
+              n_picked = len(set(tickers) & set(mdata["ticker"].tolist()))
+              if n_picked == 0:
+                  continue
+              scores.append(float(matched["LABEL_RANK_TOP20"].sum()) / n_picked)
+
+          if not scores:
+              write_output("false"); sys.exit(0)
+
+          live_prec = float(np.mean(scores))
+          ratio     = live_prec / ref_top1
+          print(f"Canli precision ({len(scores)} ay): {live_prec:.4f} | Ref: {ref_top1:.4f} | Oran: {ratio:.2f}")
+
+          if ratio < TRIGGER_RATIO:
+              print(f"UYARI: oran {ratio:.2f} < {TRIGGER_RATIO} -> erken retrain tetikleniyor")
+              write_output("true")
+          else:
+              write_output("false")
+          EOF
+
+      - name: Erken retrain tetikle (performans dususu)
+        if: steps.perf.outputs.trigger == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              workflow_id: 'quarterly_retrain.yml',
+              ref:   'main',
+              inputs: { force: 'false', fast: 'true' }
+            });
+            console.log('Erken retrain tetiklendi (canli performans dususu).');
+
+      - name: E-posta gonder
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          to: ${{ secrets.GMAIL_USERNAME }}
+          from: "US Pipeline v2 <${{ secrets.GMAIL_USERNAME }}>"
+          subject: "US Top-5 Tahmin — ${{ steps.date.outputs.month }}"
+          body: |
+            Merhaba,
+
+            ${{ steps.date.outputs.month }} donemi US hisse tahmin listesi hazirlandi.
+
+            ${{ steps.summary.outputs.top5 }}
+
+            Detayli Excel:
+            https://github.com/${{ github.repository }}/tree/main/output
+
+            ---
+            Otomatik olarak US Pipeline v2 tarafindan gonderildi.

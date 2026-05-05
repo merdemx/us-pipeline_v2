@@ -1,0 +1,176 @@
+name: Acil Retrain (Manuel)
+
+# Zamanlı schedule YOK — tam retrain (~7 saat) Actions limitini aşar.
+#
+# Normal çeyreklik retrain akışı:
+#   1. Lokalden:  python retrain.py
+#   2. Lokalden:  git add model/saved/*.pkl model/saved/versions/ model/saved/retrain_history.json
+#   3. Lokalden:  git commit -m "retrain: YYYY-QX" && git push
+#
+# Bu workflow yalnızca --fast modunda (~2.5 saat) acil durum için kullanılır.
+# fast=false seçersen timeout riskine dikkat et (6 saat limiti).
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Cok kriterli karsilastirmayi atla, her zaman guncelle"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      fast:
+        description: "Warm-start HPO (25 trial ~2.5 saat) — Actions icin onerilir"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+permissions:
+  contents: write
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 saat — yalnizca --fast ile guvenli sigiypr
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Bagimliliklar
+        run: pip install -r requirements.txt
+
+      - name: Ceyrek anahtari
+        id: date
+        run: |
+          echo "quarter=$(date +%Y)-Q$(( ($(date +%-m)-1)/3+1 ))" >> $GITHUB_OUTPUT
+          echo "month=$(date +%Y-%m)" >> $GITHUB_OUTPUT
+
+      - name: Cache — fiyat verisi
+        uses: actions/cache@v4
+        with:
+          path: cache/raw
+          key: yf-raw-${{ runner.os }}-${{ steps.date.outputs.month }}
+          restore-keys: yf-raw-${{ runner.os }}-
+
+      - name: Cache — fundamental veri
+        uses: actions/cache@v4
+        with:
+          path: cache/fundamentals
+          key: yf-fund-${{ runner.os }}-${{ steps.date.outputs.quarter }}
+          restore-keys: yf-fund-${{ runner.os }}-
+
+      - name: Retrain
+        run: |
+          FORCE_FLAG=""
+          [ "${{ github.event.inputs.force }}" = "true" ] && FORCE_FLAG="--force"
+          FAST_FLAG=""
+          [ "${{ github.event.inputs.fast }}" = "true" ] && FAST_FLAG="--fast"
+          python retrain.py $FORCE_FLAG $FAST_FLAG
+        env:
+          PYTHONIOENCODING: utf-8
+
+      - name: Commit (pkl + history + feature importance)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add model/saved/ensemble_artifacts.pkl          || true
+          git add model/saved/ensemble_artifacts_reversal.pkl || true
+          git add model/saved/versions/                       || true
+          git add model/saved/retrain_history.json            || true
+          git add model/saved/feature_importance_*.json       || true
+          git add -f output/tahmin_*.xlsx                     || true
+          if git diff --cached --quiet; then
+            echo "Commit edilecek degisiklik yok."
+          else
+            git commit -m "retrain: ${{ steps.date.outputs.quarter }} model guncellemesi [skip ci]"
+            git pull --rebase origin main
+            git push
+          fi
+
+      - name: Performans ozetini hazirla
+        id: perf
+        run: |
+          python - <<'EOF'
+          import os, json
+
+          path = "model/saved/retrain_history.json"
+          if not os.path.exists(path):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("summary<<EOF\nGecmis bulunamadi.\nEOF\n")
+              exit()
+
+          with open(path) as f:
+              history = json.load(f)
+
+          cur  = history[-1]
+          prev = history[-2] if len(history) >= 2 else None
+          kabul = "KABUL EDILDI" if cur["accepted"] else "REDDEDILDI -- eski model korundu"
+
+          def fmt(v): return f"{v:.4f}" if v is not None else "N/A"
+
+          cv  = cur.get("cv_ics")  or {}
+          oot = cur.get("oot_ics") or {}
+
+          lines = [
+              f"Tarih        : {cur['retrained_at']}",
+              f"Karar        : {kabul}",
+              f"Sebep        : {cur.get('reason', '')}",
+              "",
+              "-- Holdout Metrikleri --",
+              f"  Holdout F-beta  : {fmt(cur.get('holdout_ic'))}",
+              f"  Top-1 Precision : {fmt(cur.get('top1_precision'))}",
+              f"  Canli Precision : {fmt(cur.get('live_precision'))}",
+              "",
+              "-- CV F-beta --",
+              f"  XGBoost  : {fmt(cv.get('xgb'))}",
+              f"  LightGBM : {fmt(cv.get('lgb'))}",
+              f"  CatBoost : {fmt(cv.get('cat'))}",
+              "",
+              "-- OOT Metrikleri --",
+              f"  XGBoost  : {fmt(oot.get('xgb'))}",
+              f"  LightGBM : {fmt(oot.get('lgb'))}",
+              f"  CatBoost : {fmt(oot.get('cat'))}",
+              f"  Ensemble : {fmt(oot.get('ensemble'))}",
+          ]
+
+          if prev:
+              old = prev.get("holdout_ic")
+              new = cur.get("holdout_ic")
+              if old is not None and new is not None:
+                  lines += ["", f"Onceki modele gore F-beta: {new - old:+.4f}"]
+
+          body = "\n".join(lines)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"summary<<EOF\n{body}\nEOF\n")
+          EOF
+
+      - name: Retrain raporu gonder
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          to: ${{ secrets.GMAIL_USERNAME }}
+          from: "US Pipeline v2 <${{ secrets.GMAIL_USERNAME }}>"
+          subject: "US Model Retrain Raporu — ${{ steps.date.outputs.quarter }}"
+          body: |
+            Merhaba,
+
+            ${{ steps.date.outputs.quarter }} model retraining tamamlandi.
+
+            ${{ steps.perf.outputs.summary }}
+
+            https://github.com/${{ github.repository }}/tree/main/output
+
+            ---
+            Otomatik olarak US Pipeline v2 tarafindan gonderildi.

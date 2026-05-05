@@ -18,6 +18,9 @@ __pycache__/
 .vscode/
 .idea/
 
+# CatBoost eğitim log dosyaları
+catboost_info/
+
 # OS
 .DS_Store
 Thumbs.db
